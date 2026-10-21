@@ -62,6 +62,7 @@ defmodule Legion.AgentServer do
     {rate_limit_opts, opts} = Keyword.pop(opts, :rate_limit)
     {agent_id, opts} = Keyword.pop(opts, :agent_id)
     {vault, opts} = Keyword.pop(opts, :vault, [])
+    {callers, opts} = pop_callers!(opts)
 
     store = store || Vault.get(:store) || Application.get_env(:legion, :store)
 
@@ -92,7 +93,18 @@ defmodule Legion.AgentServer do
     Legion.Agent.warn_unknown_keys(config)
     config = Map.put(config, :rate_limit, rate_limit)
 
-    {{agent_module, config, store, agent_id, persistence_frequency, track_usage, vault}, gen_opts}
+    {{agent_module, config, store, agent_id, persistence_frequency, track_usage, vault, callers},
+     gen_opts}
+  end
+
+  defp pop_callers!(opts) do
+    {callers, opts} = Keyword.pop(opts, :callers, [])
+
+    if not (is_list(callers) and Enum.all?(callers, &is_pid/1)) do
+      raise ArgumentError, ":callers must be a list of pids, got: #{inspect(callers)}"
+    end
+
+    {callers, opts}
   end
 
   defp check_store!(%{limiter: limiter, rules: rules}, store, track_usage)
@@ -131,7 +143,11 @@ defmodule Legion.AgentServer do
   # Server callbacks
 
   @impl true
-  def init({agent_module, config, store, agent_id, _frequency, _track_usage, _vault} = init_arg) do
+  def init(
+        {agent_module, config, store, agent_id, _frequency, _track_usage, _vault, callers} =
+          init_arg
+      ) do
+    parent_agent_id = put_callers(agent_id, callers)
     stored = store && store.get(agent_id)
 
     case stored do
@@ -141,7 +157,7 @@ defmodule Legion.AgentServer do
 
       _stored ->
         case enforce_start(%{agent_module: agent_module, agent_id: agent_id, config: config}) do
-          :ok -> start(init_arg, stored)
+          :ok -> start(init_arg, parent_agent_id, stored)
           {:rate_limited, violations} -> {:error, {:rate_limited, violations}}
         end
     end
@@ -173,11 +189,28 @@ defmodule Legion.AgentServer do
         do: %{rule | policy: %Policy{window_ms: policy.window_ms, max_agents: max_agents}}
   end
 
+  # `$callers` is set before `store.get/1` so the store and anything the agent
+  # calls can find the processes that own its test allowances (Ecto sandbox,
+  # Req.Test, Mimic). Vault falls back to `$callers` too, so the parent id is
+  # read and the agent's own vault created first: the parent stays the agent
+  # in this process's ancestry, and no caller's vault is copied in.
+  defp put_callers(agent_id, callers) do
+    parent_agent_id = Vault.get(:agent_id)
+
+    if callers != [] do
+      Vault.unsafe_put(:agent_id, agent_id)
+      Process.put(:"$callers", callers)
+    end
+
+    parent_agent_id
+  end
+
   defp start(
-         {agent_module, config, store, agent_id, persistence_frequency, track_usage, vault},
+         {agent_module, config, store, agent_id, persistence_frequency, track_usage, vault,
+          _callers},
+         parent_agent_id,
          stored
        ) do
-    parent_agent_id = Vault.get(:agent_id)
     mode = Map.get(config, :start_mode, :normal)
 
     for {key, value} <- vault, do: Vault.unsafe_put(key, value)

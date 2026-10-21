@@ -125,6 +125,15 @@ defmodule Legion do
       tools and sandbox read it with `Vault.get/1`. The way to hand an agent
       something request-specific, a current user say, when it is not started
       from the process that holds it.
+    - `:callers` - a list of pids set as the agent process's `$callers` before
+      it reads its store. Code that finds its owner through `$callers`, such as
+      `Ecto.Adapters.SQL.Sandbox`, `Req.Test` and `Mimic`, then treats the agent
+      as one of those processes, as it does a `Task`. Pass
+      `[self() | Process.get(:"$callers", [])]` when starting an agent under a
+      supervisor from a test. The agent's parent id and vault still come from
+      its ancestors, not its callers. `execute/3`, `resume/2`
+      and `recover/2` pass it through; `Legion.Tools.AgentTool` sub-agents and
+      `Legion.MCP.Server` agents start without it (default: `[]`).
     - `:idle_timeout` - milliseconds without a call after which the agent stops
       normally. With a store, its state is on record and a later start under
       the same `:agent_id` continues it (default: `:infinity`).
