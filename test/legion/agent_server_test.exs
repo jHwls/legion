@@ -251,6 +251,25 @@ defmodule Legion.AgentServerTest do
     def save(_payload), do: :ok
   end
 
+  defmodule CallersStore do
+    @moduledoc "Store that records the `$callers` its `get/1` runs with, per agent id."
+    @behaviour Legion.Store
+
+    def callers_seen(agent_id), do: :persistent_term.get({__MODULE__, agent_id}, :not_read)
+
+    @impl Legion.Store
+    def get(agent_id) do
+      :persistent_term.put({__MODULE__, agent_id}, Process.get(:"$callers"))
+      :error
+    end
+
+    @impl Legion.Store
+    def list(_limit), do: []
+
+    @impl Legion.Store
+    def save(_payload), do: :ok
+  end
+
   defmodule StepMemoryStore do
     @behaviour Legion.Store
 
@@ -339,6 +358,43 @@ defmodule Legion.AgentServerTest do
       GenServer.stop(pid)
 
       assert_receive {:DOWN, ^monitor_ref, :process, ^pid, :normal}
+    end
+  end
+
+  describe ":callers" do
+    test "lets a supervised agent reach the caller's stubs without an allowance" do
+      stub(ReqLLM, :generate_object, fn _model, _messages, _schema -> llm_response("Paris") end)
+      supervisor = start_supervised!(DynamicSupervisor)
+
+      {:ok, pid} =
+        DynamicSupervisor.start_child(supervisor, {MathAgent, callers: [self()]})
+
+      assert {:ok, "Paris"} = Legion.call(pid, "What is the capital of France?")
+    end
+
+    test "are set before the store is read", %{agent_id: agent_id} do
+      {:ok, _pid} =
+        Legion.start_link(MathAgent, store: CallersStore, agent_id: agent_id, callers: [self()])
+
+      assert CallersStore.callers_seen(agent_id) == [self()]
+    end
+
+    test "leave `$callers` unset when empty", %{agent_id: agent_id} do
+      {:ok, _pid} = Legion.start_link(MathAgent, store: CallersStore, agent_id: agent_id)
+
+      assert CallersStore.callers_seen(agent_id) == nil
+    end
+
+    test "are not config" do
+      {:ok, pid} = Legion.start_link(MathAgent, callers: [self()])
+
+      refute Map.has_key?(:sys.get_state(pid).config, :callers)
+    end
+
+    test "must be a list of pids" do
+      assert_raise ArgumentError, ~r/:callers must be a list of pids/, fn ->
+        Legion.start_link(MathAgent, callers: self())
+      end
     end
   end
 
@@ -1867,6 +1923,40 @@ defmodule Legion.AgentServerGlobalTest do
 
       assert child.parent_agent_id == parent.agent_id
       assert {:ok, %{messages: [%{content: "child task"} | _]}} = MemoryStore.load(child.agent_id)
+    end
+
+    test "keep their parent's id when the parent was given callers" do
+      stub(ReqLLM, :generate_object, fn _model, messages, _schema ->
+        if Enum.any?(messages, &(&1[:content] == "child task")) do
+          llm_response("child done")
+        else
+          llm_eval_response(~s|AgentTool.call(ChildAgent, "child task")|)
+        end
+      end)
+
+      supervisor = start_supervised!(DynamicSupervisor)
+
+      # The caller holds a vault but is not an ancestor of the agent, so its
+      # agent id must not become the parent's.
+      Task.async(fn ->
+        Vault.init(agent_id: "caller-vault")
+
+        {:ok, pid} =
+          DynamicSupervisor.start_child(
+            supervisor,
+            {DelegatingAgent, store: MemoryStore, callers: [self()]}
+          )
+
+        assert {:ok, _result} = Legion.call(pid, "parent task")
+      end)
+      |> Task.await()
+
+      runs = MemoryStore.runs()
+      parent = Enum.find(runs, &(&1.agent_module == DelegatingAgent))
+      child = Enum.find(runs, &(&1.agent_module == ChildAgent))
+
+      assert parent.parent_agent_id == nil
+      assert child.parent_agent_id == parent.agent_id
     end
 
     test "inherit the limiter and every rule" do

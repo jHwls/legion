@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Agents
+
+- **`:callers` start option** - [`Legion.start_link/2`](https://hexdocs.pm/legion/Legion.html#start_link/2) takes a list of pids that the agent sets as its `$callers` before reading its store, so an agent started under a supervisor reaches its starter's Ecto sandbox connection, `Req.Test` stubs and Mimic stubs, as a `Task` does; its parent id and vault still come from its ancestors
+
 ## v0.6.0 - 2026-10-13
 
 ### Highlights
